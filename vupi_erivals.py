@@ -46,7 +46,7 @@ SLEEP_LOOP         = 0.5
 ACEITA_MUDANCA_ODD = True   # oddsChangeAction=3 → Vupi aceita qualquer mudança
 
 # Liga
-LIGA_KEYWORD = "h2h gg"   # case-insensitive, ignora espaços ("FC 26" também passa)
+LIGA_KEYWORD = "fc26"   # case-insensitive, ignora espaços ("FC 26" também passa)
 
 # Aposta — AJUSTAR
 STAKE = 1.0
@@ -214,12 +214,32 @@ async def vp_obter_jwt(ctx, sessionid: str, identity: str) -> tuple[str, float]:
 # ╚══════════════════════════════════════════════════════════════╝
 
 async def vp_esta_logado(page) -> bool:
-    """Verifica login via DOM — saldo visível = logado, botão Entrar visível = não logado.
-    Mais confiável que storage (Vupi pode usar HttpOnly cookies)."""
+    """Verifica login via localStorage (marcadores Vupi) com fallback DOM.
+
+    Sinais que a Vupi grava no localStorage SÓ quando logado:
+      - eb-identity     (token de identidade)
+      - profileInfos    (info do perfil)
+      - login           (flag)
+      - lastActiveSessionTime  (timestamp de sessão)
+    Se qualquer um desses estiver presente → logado.
+    Senão, fallback pra checagem visual (saldo / botão Entrar).
+    """
     try:
         result = await page.evaluate("""
             () => {
-                // 1. Procura saldo/balance visível
+                // ── 1) Marcadores fortes no localStorage ──
+                const STRONG_MARKERS = [
+                    'eb-identity', 'profileInfos', 'login',
+                    'lastActiveSessionTime',
+                ];
+                for (const key of STRONG_MARKERS) {
+                    const v = localStorage.getItem(key);
+                    if (v && v.length > 0) {
+                        return { logged: true, via: 'localStorage:' + key };
+                    }
+                }
+
+                // ── 2) Fallback DOM: saldo visível ──
                 const balanceSelectors = [
                     '[data-testid*="balance" i]',
                     '[data-testid*="saldo" i]',
@@ -236,48 +256,24 @@ async def vp_esta_logado(page) -> bool:
                         const visible = rect.width > 0 && rect.height > 0;
                         const text = (el.innerText || '').trim();
                         if (visible && text && /R\\$|\\d/.test(text)) {
-                            return { logged: true, via: 'balance', value: text.slice(0, 40), sel };
+                            return { logged: true, via: 'balance', value: text.slice(0, 40) };
                         }
                     }
                 }
 
-                // 2. Procura botão "Entrar" — se visível = NÃO logado
-                let entrarVisible = false;
+                // ── 3) Botão Entrar visível → deslogado ──
                 const candidates = document.querySelectorAll('button, a');
                 for (const el of candidates) {
                     const t = (el.innerText || '').trim().toLowerCase();
                     if (t === 'entrar' || t === 'login' || t === 'entrar / cadastrar') {
                         const r = el.getBoundingClientRect();
                         if (r.width > 0 && r.height > 0) {
-                            entrarVisible = true;
-                            break;
-                        }
-                    }
-                }
-                if (entrarVisible) {
-                    return { logged: false, via: 'entrar_button_visible' };
-                }
-
-                // 3. Procura elemento de profile/avatar/menu user (indicador secundário)
-                const userIndicators = [
-                    '[data-testid*="user-menu" i]',
-                    '[data-testid*="profile" i]',
-                    '[data-testid*="account" i]',
-                    '[class*="userMenu" i]',
-                    '[class*="UserMenu" i]',
-                    '[class*="Avatar" i]',
-                ];
-                for (const sel of userIndicators) {
-                    const el = document.querySelector(sel);
-                    if (el) {
-                        const r = el.getBoundingClientRect();
-                        if (r.width > 0 && r.height > 0) {
-                            return { logged: true, via: 'user_menu', sel };
+                            return { logged: false, via: 'entrar_button_visible' };
                         }
                     }
                 }
 
-                // Inconclusivo — sem saldo visível, sem botão Entrar, sem menu user
+                // Inconclusivo
                 return { logged: false, via: 'inconclusive' };
             }
         """)
@@ -489,6 +485,8 @@ async def vp_listagem(client: httpx.AsyncClient) -> list[dict]:
                          params=p, headers=VP_HEADERS, timeout=15)
     r.raise_for_status()
     data = r.json()
+    # Normaliza a keyword do mesmo jeito que normaliza o champ (lower + sem espaço)
+    kw = LIGA_KEYWORD.lower().replace(" ", "")
     out = []
     for sport in data.get("Result", {}).get("Items", []) or []:
         for champ in sport.get("Items", []) or []:
@@ -497,7 +495,7 @@ async def vp_listagem(client: httpx.AsyncClient) -> list[dict]:
                 # ChampName pode vir no ev ou no champ pai
                 champ_name = ev.get("ChampName", "") or champ_name_top
                 norm = champ_name.lower().replace(" ", "")
-                if LIGA_KEYWORD not in norm:
+                if kw not in norm:
                     continue
                 out.append({
                     "id": ev["Id"],
@@ -760,7 +758,7 @@ async def processar_jogo(ctx, jwt, httpx_client, ev, j: JogoState):
     if linha >= j.ult_linha_apostada:
         return
 
-    print(f"\n🎯 FC26 | {ev['name']}  [{ev['champ']}]")
+    print(f"\n🎯 {LIGA_KEYWORD.upper()} | {ev['name']}  [{ev['champ']}]")
     print(f"   score={sh}-{sa}  linha={linha}  gols_pra_bater={gols_pb}  "
           f"odd={sel['Price']}  live_time={ev['live_time']!r}")
     j.ult_tentativa = time.time()
@@ -902,7 +900,7 @@ async def main():
                 await processar_jogo(ctx, jwt, httpx_client, ev, jogos[ev["id"]])
 
             if ciclo % 20 == 0:
-                print(f"[{ciclo}] FC26_vivos={len(eventos)}  "
+                print(f"[{ciclo}] {LIGA_KEYWORD}_vivos={len(eventos)}  "
                       f"jogos_rastreados={len(jogos)}  "
                       f"tent={STATS.tentativas} ok={STATS.aceitas} "
                       f"rej={STATS.rejeitadas}")
