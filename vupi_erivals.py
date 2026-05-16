@@ -320,7 +320,7 @@ async def vp_dump_storage(page):
 
 
 async def vp_fazer_login(page) -> bool:
-    """Login automático na Vupi. Seletores defensivos (várias variações)."""
+    """Login automático na Vupi. Click via JS, espera modal, preenche, submete."""
     print("  🔐 fazendo login automático na Vupi...")
 
     if "vupi.bet.br" not in (page.url or ""):
@@ -328,114 +328,152 @@ async def vp_fazer_login(page) -> bool:
                         wait_until="domcontentloaded")
         await asyncio.sleep(2)
 
-    # 1. Abre modal de login
-    abrir_login_selectors = [
-        'button:has-text("Entrar")',
-        'a:has-text("Entrar")',
-        'button:has-text("Login")',
-        '[data-testid*="login"][role="button"]',
-        'header button:has-text("Entrar")',
-    ]
-    for sel in abrir_login_selectors:
-        try:
-            btn = page.locator(sel).first
-            if await btn.is_visible(timeout=1500):
-                await btn.click()
-                print(f"    modal aberto via: {sel}")
-                await asyncio.sleep(1.5)
-                break
-        except Exception:
-            continue
-
-    # 2. Campo email/CPF
-    email_selectors = [
-        'input[data-testid="login-input-cpf-email"]',
-        'input[data-testid*="email"]',
-        'input[data-testid*="cpf"]',
-        'input[name="username"]',
-        'input[name="email"]',
-        'input[name="cpf"]',
-        'input[type="email"]',
-        'input[placeholder*="mail" i]',
-        'input[placeholder*="cpf" i]',
-        'input[autocomplete="username"]',
-    ]
-    email_field = None
-    for sel in email_selectors:
-        try:
-            f = page.locator(sel).first
-            if await f.is_visible(timeout=1500):
-                email_field = f
-                print(f"    campo email: {sel}")
-                break
-        except Exception:
-            continue
-    if not email_field:
-        print("    ❌ campo de email não encontrado")
+    # 1. Clica em "Entrar" via JS (mesma lógica que vp_esta_logado usa pra detectar)
+    clicked = await page.evaluate("""
+        () => {
+            const candidates = document.querySelectorAll('button, a, [role="button"], div[onclick]');
+            for (const el of candidates) {
+                const t = (el.innerText || '').trim().toLowerCase();
+                if (t === 'entrar' || t === 'login' || t === 'entrar / cadastrar'
+                    || (t.startsWith('entrar') && t.length < 25)) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) {
+                        el.click();
+                        return { ok: true, text: t, tag: el.tagName };
+                    }
+                }
+            }
+            return { ok: false };
+        }
+    """)
+    if not clicked.get("ok"):
+        print("    ❌ botão Entrar não achado pra clicar")
         return False
-    await email_field.click()
-    await email_field.fill("")
-    await email_field.type(EMAIL_VUPI, delay=random.randint(30, 80))
+    print(f"    ✓ clicou em <{clicked.get('tag')}> '{clicked.get('text')}'")
 
-    # 3. Campo senha
-    senha_selectors = [
-        'input[data-testid="login-input-password"]',
-        'input[type="password"]',
-        'input[data-testid*="password"]',
-        'input[name="password"]',
-        'input[autocomplete="current-password"]',
-    ]
+    # 2. Aguarda campo de SENHA aparecer (sinal robusto que o modal abriu)
+    print("    aguardando modal de login abrir...")
     senha_field = None
-    for sel in senha_selectors:
+    for _ in range(20):  # ~10s
         try:
-            f = page.locator(sel).first
-            if await f.is_visible(timeout=1500):
+            f = page.locator('input[type="password"]').first
+            if await f.is_visible(timeout=500):
                 senha_field = f
-                print(f"    campo senha: {sel}")
                 break
         except Exception:
-            continue
+            pass
+        await asyncio.sleep(0.5)
     if not senha_field:
-        print("    ❌ campo de senha não encontrado")
+        print("    ❌ modal não abriu em 10s (campo senha não apareceu)")
         return False
+    print("    ✓ modal aberto")
+
+    # 3. Acha campo de email = primeiro input visível que NÃO é password
+    inputs_info = await page.evaluate("""
+        () => {
+            const inputs = document.querySelectorAll('input');
+            return Array.from(inputs)
+                .map((el, idx) => {
+                    const r = el.getBoundingClientRect();
+                    return {
+                        idx: idx,
+                        visible: r.width > 0 && r.height > 0,
+                        type: el.type,
+                        name: el.name || '',
+                        placeholder: el.placeholder || '',
+                        testid: el.getAttribute('data-testid') || '',
+                        autocomplete: el.autocomplete || '',
+                    };
+                })
+                .filter(i => i.visible);
+        }
+    """)
+    print(f"    inputs visíveis: {len(inputs_info)}")
+    for inp in inputs_info:
+        print(f"      [{inp['idx']}] type={inp['type']!r} name={inp['name']!r} "
+              f"testid={inp['testid']!r} placeholder={inp['placeholder']!r}")
+
+    # Procura o melhor candidato pra email
+    email_idx = None
+    for inp in inputs_info:
+        t = inp["type"]
+        if t in ("password", "hidden", "submit", "button", "checkbox", "radio"):
+            continue
+        # Prioridade 1: type=email
+        if t == "email":
+            email_idx = inp["idx"]; break
+        # Prioridade 2: name/testid/placeholder contém email|cpf|user
+        marker = f"{inp['name']} {inp['testid']} {inp['placeholder']} {inp['autocomplete']}".lower()
+        if any(x in marker for x in ("email", "cpf", "user", "login")):
+            email_idx = inp["idx"]; break
+    # Fallback: primeiro input texto/sem type
+    if email_idx is None:
+        for inp in inputs_info:
+            if inp["type"] in ("text", ""):
+                email_idx = inp["idx"]; break
+
+    if email_idx is None:
+        print("    ❌ campo de email não achado entre os inputs visíveis")
+        return False
+
+    print(f"    campo email: índice {email_idx}")
+    email_locator = page.locator("input").nth(email_idx)
+    await email_locator.click()
+    await email_locator.fill("")
+    await email_locator.type(EMAIL_VUPI, delay=random.randint(30, 80))
+
+    # 4. Preenche senha
     await senha_field.click()
     await senha_field.fill("")
     await senha_field.type(SENHA_VUPI, delay=random.randint(30, 70))
     await asyncio.sleep(0.3)
 
-    # 4. Submete
-    submit_selectors = [
-        'button[data-testid="login-button-submit"]',
-        'button[data-testid*="submit"]',
-        'button[type="submit"]',
-        'form button:has-text("Entrar")',
-    ]
-    submitted = False
-    for sel in submit_selectors:
-        try:
-            btn = page.locator(sel).last
-            if await btn.is_visible(timeout=1000):
-                await btn.click()
-                print(f"    submit: {sel}")
-                submitted = True
-                break
-        except Exception:
-            continue
-    if not submitted:
+    # 5. Submete via JS (acha botão de submit dentro do form de login)
+    submitted_via = await page.evaluate("""
+        () => {
+            // Procura botão submit dentro do form que contém o input password
+            const pwd = document.querySelector('input[type="password"]');
+            if (!pwd) return null;
+            let form = pwd.closest('form');
+            const root = form || document;
+            // Tenta submit explícito
+            let btn = root.querySelector('button[type="submit"]');
+            if (btn) { btn.click(); return 'button[type=submit]'; }
+            // Tenta data-testid
+            btn = root.querySelector('[data-testid*="submit" i],[data-testid*="login" i]');
+            if (btn && btn.tagName === 'BUTTON') { btn.click(); return btn.getAttribute('data-testid'); }
+            // Tenta qualquer botão com texto "entrar"/"login"
+            const btns = root.querySelectorAll('button, [role="button"]');
+            for (const b of btns) {
+                const t = (b.innerText || '').trim().toLowerCase();
+                if (t === 'entrar' || t === 'login' || t === 'acessar') {
+                    const r = b.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) {
+                        b.click();
+                        return `text=${t}`;
+                    }
+                }
+            }
+            return null;
+        }
+    """)
+    if submitted_via:
+        print(f"    submit via JS: {submitted_via}")
+    else:
         await senha_field.press("Enter")
-        print("    submit: Enter")
+        print("    submit via Enter")
 
-    # 5. Aguarda algum sinal de sessão (mais tolerante: 30s)
-    print("    aguardando login completar...")
-    for _ in range(60):  # ~30s
+    # 6. Aguarda confirmação de login (saldo visível ou Entrar sumiu)
+    print("    aguardando login completar (30s)...")
+    for _ in range(60):
         if await vp_esta_logado(page):
-            print(f"    ✅ logado")
+            print("    ✅ logado")
             await asyncio.sleep(1)
             return True
         await asyncio.sleep(0.5)
 
-    print("    ⚠️ timeout — checagem não confirmou em 30s")
-    print("    fazendo dump de storage pra debug:")
+    print("    ⚠️ timeout — saldo não apareceu / Entrar ainda visível")
+    print("    dump de storage pra debug:")
     await vp_dump_storage(page)
     return False
 
