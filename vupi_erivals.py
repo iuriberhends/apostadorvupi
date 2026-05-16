@@ -43,10 +43,10 @@ SENHA_VUPI = os.getenv("VUPI_SENHA", "Haniel123")
 
 # Loop
 SLEEP_LOOP         = 0.5
-ACEITA_MUDANCA_ODD = True   # oddsChangeAction=2 → Vupi aceita mesmo se odd mudar
+ACEITA_MUDANCA_ODD = True   # oddsChangeAction=3 → Vupi aceita qualquer mudança
 
 # Liga
-LIGA_KEYWORD = "fc26"   # case-insensitive, ignora espaços ("FC 26" também passa)
+LIGA_KEYWORD = "h2h gg"   # case-insensitive, ignora espaços ("FC 26" também passa)
 
 # Aposta — AJUSTAR
 STAKE = 1.0
@@ -183,15 +183,18 @@ async def vp_obter_jwt(ctx, sessionid: str, identity: str) -> tuple[str, float]:
     if not auth_token:
         raise RuntimeError(f"sem authToken: {body1}")
 
+    # Body completo conforme captura real (precisa de todos os VP_PARAMS + token)
+    signin_body = {**VP_PARAMS, "token": auth_token}
     r2 = await ctx.request.post(
-        f"{VP_AUTH}/api/Auth/SignIn",
-        data=json.dumps({"integration": "vupi", "token": auth_token}),
+        f"{VP_AUTH}/api/WidgetAuth/SignIn",
+        data=json.dumps(signin_body),
         headers={"Content-Type": "application/json", "Accept": "application/json"})
     text = await r2.text()
     if r2.status != 200:
         raise RuntimeError(f"SignIn HTTP {r2.status}: {text[:200]}")
     d2 = json.loads(text)
-    jwt = d2.get("Result", {}).get("AccessToken") or d2.get("accessToken")
+    # Resposta nova vem no root, não em Result (mantém fallback)
+    jwt = d2.get("accessToken") or d2.get("Result", {}).get("AccessToken")
     if not jwt:
         raise RuntimeError(f"sem JWT: {text[:200]}")
 
@@ -210,36 +213,84 @@ async def vp_obter_jwt(ctx, sessionid: str, identity: str) -> tuple[str, float]:
 # ║  VUPI LOGIN AUTOMÁTICO                                        ║
 # ╚══════════════════════════════════════════════════════════════╝
 
-# Padrões de chave que indicam sessão autenticada
-AUTH_KEY_PATTERNS = ("session", "identity", "auth", "token", "user", "jwt",
-                     "access", "login")
-
-
 async def vp_esta_logado(page) -> bool:
-    """True se há sinais de sessão ativa em localStorage OU sessionStorage."""
+    """Verifica login via DOM — saldo visível = logado, botão Entrar visível = não logado.
+    Mais confiável que storage (Vupi pode usar HttpOnly cookies)."""
     try:
-        result = await page.evaluate(f"""
-            () => {{
-                const patterns = {list(AUTH_KEY_PATTERNS)};
-                const check = (store) => {{
-                    for (const k of Object.keys(store)) {{
-                        const kl = k.toLowerCase();
-                        if (patterns.some(p => kl.includes(p))) {{
-                            const val = store.getItem(k);
-                            if (val && val.length > 5) return k;
-                        }}
-                    }}
-                    return null;
-                }};
-                const ls = check(localStorage);
-                if (ls) return {{ found: true, key: ls, store: 'localStorage' }};
-                const ss = check(sessionStorage);
-                if (ss) return {{ found: true, key: ss, store: 'sessionStorage' }};
-                return {{ found: false }};
-            }}
+        result = await page.evaluate("""
+            () => {
+                // 1. Procura saldo/balance visível
+                const balanceSelectors = [
+                    '[data-testid*="balance" i]',
+                    '[data-testid*="saldo" i]',
+                    '[data-testid="header-balance-value"]',
+                    '[class*="balance" i]',
+                    '[class*="Saldo" i]',
+                    '[class*="HeaderBalance" i]',
+                    '[class*="userBalance" i]',
+                ];
+                for (const sel of balanceSelectors) {
+                    const els = document.querySelectorAll(sel);
+                    for (const el of els) {
+                        const rect = el.getBoundingClientRect();
+                        const visible = rect.width > 0 && rect.height > 0;
+                        const text = (el.innerText || '').trim();
+                        if (visible && text && /R\\$|\\d/.test(text)) {
+                            return { logged: true, via: 'balance', value: text.slice(0, 40), sel };
+                        }
+                    }
+                }
+
+                // 2. Procura botão "Entrar" — se visível = NÃO logado
+                let entrarVisible = false;
+                const candidates = document.querySelectorAll('button, a');
+                for (const el of candidates) {
+                    const t = (el.innerText || '').trim().toLowerCase();
+                    if (t === 'entrar' || t === 'login' || t === 'entrar / cadastrar') {
+                        const r = el.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0) {
+                            entrarVisible = true;
+                            break;
+                        }
+                    }
+                }
+                if (entrarVisible) {
+                    return { logged: false, via: 'entrar_button_visible' };
+                }
+
+                // 3. Procura elemento de profile/avatar/menu user (indicador secundário)
+                const userIndicators = [
+                    '[data-testid*="user-menu" i]',
+                    '[data-testid*="profile" i]',
+                    '[data-testid*="account" i]',
+                    '[class*="userMenu" i]',
+                    '[class*="UserMenu" i]',
+                    '[class*="Avatar" i]',
+                ];
+                for (const sel of userIndicators) {
+                    const el = document.querySelector(sel);
+                    if (el) {
+                        const r = el.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0) {
+                            return { logged: true, via: 'user_menu', sel };
+                        }
+                    }
+                }
+
+                // Inconclusivo — sem saldo visível, sem botão Entrar, sem menu user
+                return { logged: false, via: 'inconclusive' };
+            }
         """)
-        return bool(result and result.get("found"))
-    except Exception:
+        if result and result.get("logged"):
+            print(f"  ✓ logado via {result.get('via')}"
+                  + (f" ({result.get('value')})" if result.get('value') else ""))
+            return True
+        else:
+            via = result.get("via", "?") if result else "erro"
+            print(f"  ✗ não logado (via: {via})")
+            return False
+    except Exception as e:
+        print(f"  erro vp_esta_logado: {e}")
         return False
 
 
@@ -583,7 +634,7 @@ async def vp_apostar(ctx, jwt, ev, market, sel, stake) -> dict:
                 "mostBalanced": sel.get("MB", 0) == 1,
                 "selectionTypeId": sel.get("SelectionTypeId", 12),
                 "selectionName": sel.get("Name", ""),
-                "widgetInfo": {"widget": 12, "page": 4, "tabIndex": 4,
+                "widgetInfo": {"widget": 12, "page": 4, "tabIndex": 3,
                                "tipsterId": None, "suggestionType": None}
             }]
         }],
