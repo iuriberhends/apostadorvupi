@@ -52,6 +52,10 @@ ACEITA_MUDANCA_ODD = True   # oddsChangeAction=3 → Vupi aceita qualquer mudan�
 LIGA_CHAMP_ID = None           # ex: 43801 = Volta FA Cup. None = usa LIGA_KEYWORD
 LIGA_KEYWORD = "fc26"          # case-insensitive, ignora espaços ("FC 26" também passa)
 
+# SPORT_ID — OBRIGATÓRIO no GetLiveEvents (sem isso Altenar retorna 555).
+# Valores comuns Vupi:  147=E-Basquete  318=E-Football/FIFA
+SPORT_ID = 318
+
 # Aposta — AJUSTAR
 STAKE = 1.0
 MAX_APOSTAS_POR_JOGO = 2
@@ -492,18 +496,14 @@ async def vp_fazer_login(page) -> bool:
 # ║  VUPI SPORTSBOOK                                              ║
 # ╚══════════════════════════════════════════════════════════════╝
 
-async def vp_listagem(ctx) -> list[dict]:
-    """Lista TODOS os live events via ctx.request (TLS do browser → bypass CF).
+async def vp_listagem(client: httpx.AsyncClient) -> list[dict]:
+    """Lista live events do SPORT_ID configurado.
     Filtra por LIGA_CHAMP_ID (se definido) ou LIGA_KEYWORD."""
-    # Monta query string manualmente
-    params = {**VP_PARAMS, "eventCount": 0}
-    qs = "&".join(f"{k}={v}" for k, v in params.items())
-    url = f"{VP_FRONT}/api/Sportsbook/GetLiveEvents?{qs}"
-
-    r = await ctx.request.get(url, headers=VP_HEADERS, timeout=15000)
-    if r.status != 200:
-        raise RuntimeError(f"GetLiveEvents HTTP {r.status}")
-    data = await r.json()
+    p = {**VP_PARAMS, "sportIds": SPORT_ID, "eventCount": 0}
+    r = await client.get(f"{VP_FRONT}/api/Sportsbook/GetLiveEvents",
+                         params=p, headers=VP_HEADERS, timeout=15)
+    r.raise_for_status()
+    data = r.json()
 
     use_id = LIGA_CHAMP_ID is not None
     kw = LIGA_KEYWORD.lower().replace(" ", "") if not use_id else None
@@ -514,13 +514,11 @@ async def vp_listagem(ctx) -> list[dict]:
             champ_id = champ.get("Id")
             champ_name_top = champ.get("Name", "")
 
-            # Filtro por ID — pula champs que não batem
             if use_id and champ_id != LIGA_CHAMP_ID:
                 continue
 
             for ev in champ.get("Events", []) or []:
                 champ_name = ev.get("ChampName", "") or champ_name_top
-                # Filtro por keyword (só se não estamos filtrando por ID)
                 if not use_id:
                     norm = champ_name.lower().replace(" ", "")
                     if kw not in norm:
@@ -539,15 +537,13 @@ async def vp_listagem(ctx) -> list[dict]:
     return out
 
 
-async def vp_detalhe(ctx, eid: int) -> dict | None:
-    params = {**VP_PARAMS, "eventId": eid}
-    qs = "&".join(f"{k}={v}" for k, v in params.items())
-    url = f"{VP_FRONT}/api/Sportsbook/GetEventDetails?{qs}"
+async def vp_detalhe(client: httpx.AsyncClient, eid: int) -> dict | None:
+    p = {**VP_PARAMS, "eventId": eid}
     try:
-        r = await ctx.request.get(url, headers=VP_HEADERS, timeout=10000)
-        if r.status == 200:
-            data = await r.json()
-            return data.get("Result", {})
+        r = await client.get(f"{VP_FRONT}/api/Sportsbook/GetEventDetails",
+                             params=p, headers=VP_HEADERS, timeout=10)
+        if r.status_code == 200:
+            return r.json().get("Result", {})
     except Exception as e:
         print(f"   detalhe {eid} erro: {e}")
     return None
@@ -742,7 +738,7 @@ async def vp_apostar(ctx, jwt, ev, market, sel, stake) -> dict:
 # ║  PROCESSAR 1 JOGO                                             ║
 # ╚══════════════════════════════════════════════════════════════╝
 
-async def processar_jogo(ctx, jwt, ev, j: JogoState):
+async def processar_jogo(ctx, jwt, httpx_client, ev, j: JogoState):
     if j.bloqueado:
         return
     if j.entradas >= MAX_APOSTAS_POR_JOGO:
@@ -759,7 +755,7 @@ async def processar_jogo(ctx, jwt, ev, j: JogoState):
         return
     sh, sa = sc
 
-    det = await vp_detalhe(ctx, ev["id"])
+    det = await vp_detalhe(httpx_client, ev["id"])
     if not det:
         return
 
@@ -904,6 +900,7 @@ async def main():
 
     jogos: dict[int, JogoState] = {}
     ciclo = 0
+    httpx_client = httpx.AsyncClient(timeout=10)
     listagem_falhas_seguidas = 0  # pra backoff
 
     print("\n" + "-" * 62)
@@ -921,13 +918,12 @@ async def main():
                     print(f"[{ciclo}] erro renovando JWT: {e}")
 
             try:
-                eventos = await vp_listagem(ctx)
+                eventos = await vp_listagem(httpx_client)
                 listagem_falhas_seguidas = 0  # reset no sucesso
             except Exception as e:
                 listagem_falhas_seguidas += 1
-                # Backoff: 5s, 10s, 20s, 40s, máx 60s
                 wait = min(60, 5 * (2 ** min(listagem_falhas_seguidas - 1, 4)))
-                msg = str(e)[:120]
+                msg = str(e)[:200]
                 print(f"[{ciclo}] listagem erro #{listagem_falhas_seguidas} "
                       f"(aguardando {wait}s): {msg}")
                 await asyncio.sleep(wait)
@@ -940,7 +936,7 @@ async def main():
                     print(f"🆕 [{ev['champ']}] sportId={ev['sport_id']}  "
                           f"{ev['name']}  score={ev['score']!r}  "
                           f"time={ev['live_time']!r}")
-                await processar_jogo(ctx, jwt, ev, jogos[ev["id"]])
+                await processar_jogo(ctx, jwt, httpx_client, ev, jogos[ev["id"]])
 
             if ciclo % 20 == 0:
                 liga_tag = (f"champ{LIGA_CHAMP_ID}" if LIGA_CHAMP_ID is not None
@@ -961,6 +957,7 @@ async def main():
     except KeyboardInterrupt:
         print("\n🛑 PARADO")
     finally:
+        await httpx_client.aclose()
         await pw.stop()
 
         print("\n" + "=" * 62)
