@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDEs
+.idea/
+.vscode/
+
+# Credenciais
+.env
+.env.*
+credenciais.json
+*_secret*
+
+# Logs e dados runtime
+*.log
+apostas_log.csv
+banca_state.json
+ciclo_state.json
+tips.txt
+resultado_apostas.json
+resultado_calculator.json
+fila_calculator.json
+historico_tips.csv
+vupi_aposta_response.json
+vupi_erivals_recon.json
+
+# OS
+.DS_Store
+Thumbs.db
