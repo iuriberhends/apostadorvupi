@@ -210,17 +210,62 @@ async def vp_obter_jwt(ctx, sessionid: str, identity: str) -> tuple[str, float]:
 # ║  VUPI LOGIN AUTOMÁTICO                                        ║
 # ╚══════════════════════════════════════════════════════════════╝
 
+# Padrões de chave que indicam sessão autenticada
+AUTH_KEY_PATTERNS = ("session", "identity", "auth", "token", "user", "jwt",
+                     "access", "login")
+
+
 async def vp_esta_logado(page) -> bool:
-    """True se já tem sessionid no localStorage."""
+    """True se há sinais de sessão ativa em localStorage OU sessionStorage."""
     try:
-        sid = await page.evaluate(
-            "() => localStorage.getItem('sessionid') || "
-            "localStorage.getItem('SessionId') || "
-            "localStorage.getItem('session_id')"
-        )
-        return bool(sid)
+        result = await page.evaluate(f"""
+            () => {{
+                const patterns = {list(AUTH_KEY_PATTERNS)};
+                const check = (store) => {{
+                    for (const k of Object.keys(store)) {{
+                        const kl = k.toLowerCase();
+                        if (patterns.some(p => kl.includes(p))) {{
+                            const val = store.getItem(k);
+                            if (val && val.length > 5) return k;
+                        }}
+                    }}
+                    return null;
+                }};
+                const ls = check(localStorage);
+                if (ls) return {{ found: true, key: ls, store: 'localStorage' }};
+                const ss = check(sessionStorage);
+                if (ss) return {{ found: true, key: ss, store: 'sessionStorage' }};
+                return {{ found: false }};
+            }}
+        """)
+        return bool(result and result.get("found"))
     except Exception:
         return False
+
+
+async def vp_dump_storage(page):
+    """Imprime keys de localStorage e sessionStorage pra debug."""
+    try:
+        debug = await page.evaluate("""
+            () => ({
+                ls: Object.fromEntries(
+                    Object.keys(localStorage).map(k => [k, (localStorage.getItem(k) || '').slice(0, 60)])
+                ),
+                ss: Object.fromEntries(
+                    Object.keys(sessionStorage).map(k => [k, (sessionStorage.getItem(k) || '').slice(0, 60)])
+                ),
+                cookies: document.cookie ? document.cookie.split('; ').map(c => c.split('=')[0]) : [],
+            })
+        """)
+        print(f"    DEBUG localStorage keys: {list(debug['ls'].keys())}")
+        for k, v in debug['ls'].items():
+            print(f"      ls[{k}] = {v!r}")
+        print(f"    DEBUG sessionStorage keys: {list(debug['ss'].keys())}")
+        for k, v in debug['ss'].items():
+            print(f"      ss[{k}] = {v!r}")
+        print(f"    DEBUG cookie names: {debug['cookies']}")
+    except Exception as e:
+        print(f"    debug erro: {e}")
 
 
 async def vp_fazer_login(page) -> bool:
@@ -329,15 +374,18 @@ async def vp_fazer_login(page) -> bool:
         await senha_field.press("Enter")
         print("    submit: Enter")
 
-    # 5. Aguarda sessionid aparecer no localStorage
+    # 5. Aguarda algum sinal de sessão (mais tolerante: 30s)
     print("    aguardando login completar...")
-    for _ in range(40):  # ~20s
+    for _ in range(60):  # ~30s
         if await vp_esta_logado(page):
             print(f"    ✅ logado")
             await asyncio.sleep(1)
             return True
         await asyncio.sleep(0.5)
-    print("    ⚠️ timeout — login não confirmou em 20s")
+
+    print("    ⚠️ timeout — checagem não confirmou em 30s")
+    print("    fazendo dump de storage pra debug:")
+    await vp_dump_storage(page)
     return False
 
 
@@ -702,18 +750,30 @@ async def main():
         print("-> sessão já ativa")
     else:
         print("-> sem sessão, executando login automático...")
-        if not await vp_fazer_login(page):
-            print("❌ Login automático falhou. Loga manual na janela do "
-                  "Chrome e roda de novo (ou ajusta os seletores).")
-            return
+        login_ok = await vp_fazer_login(page)
+        if not login_ok:
+            print("⚠️ checagem de login falhou, mas vou tentar capturar "
+                  "auth pelos headers mesmo assim (pode ter logado)...")
 
+    # Captura sessionid/identity (tem fallback via header de requisição)
     print("-> auth Vupi (capturando sessionid + identity)...")
-    sessionid, identity = await vp_capturar_auth(page)
-    print(f"  sessionid={sessionid[:20]}...  identity={identity[:20]}...")
+    try:
+        sessionid, identity = await vp_capturar_auth(page)
+        print(f"  sessionid={sessionid[:20]}...  identity={identity[:20]}...")
+    except Exception as e:
+        print(f"❌ Falha ao capturar auth: {e}")
+        print("   Loga manual na janela do Chrome e roda de novo.")
+        await pw.stop()
+        return
 
     print("-> JWT Altenar...")
-    jwt, jwt_exp = await vp_obter_jwt(ctx, sessionid, identity)
-    print(f"  JWT exp em {(jwt_exp - time.time()):.0f}s")
+    try:
+        jwt, jwt_exp = await vp_obter_jwt(ctx, sessionid, identity)
+        print(f"  JWT exp em {(jwt_exp - time.time()):.0f}s")
+    except Exception as e:
+        print(f"❌ Falha ao obter JWT: {e}")
+        await pw.stop()
+        return
 
     csv_init()
     print(f"-> log CSV: {LOG_CSV.resolve()}")
