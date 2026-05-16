@@ -207,6 +207,141 @@ async def vp_obter_jwt(ctx, sessionid: str, identity: str) -> tuple[str, float]:
 
 
 # ╔══════════════════════════════════════════════════════════════╗
+# ║  VUPI LOGIN AUTOMÁTICO                                        ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+async def vp_esta_logado(page) -> bool:
+    """True se já tem sessionid no localStorage."""
+    try:
+        sid = await page.evaluate(
+            "() => localStorage.getItem('sessionid') || "
+            "localStorage.getItem('SessionId') || "
+            "localStorage.getItem('session_id')"
+        )
+        return bool(sid)
+    except Exception:
+        return False
+
+
+async def vp_fazer_login(page) -> bool:
+    """Login automático na Vupi. Seletores defensivos (várias variações)."""
+    print("  🔐 fazendo login automático na Vupi...")
+
+    if "vupi.bet.br" not in (page.url or ""):
+        await page.goto("https://www.vupi.bet.br/",
+                        wait_until="domcontentloaded")
+        await asyncio.sleep(2)
+
+    # 1. Abre modal de login
+    abrir_login_selectors = [
+        'button:has-text("Entrar")',
+        'a:has-text("Entrar")',
+        'button:has-text("Login")',
+        '[data-testid*="login"][role="button"]',
+        'header button:has-text("Entrar")',
+    ]
+    for sel in abrir_login_selectors:
+        try:
+            btn = page.locator(sel).first
+            if await btn.is_visible(timeout=1500):
+                await btn.click()
+                print(f"    modal aberto via: {sel}")
+                await asyncio.sleep(1.5)
+                break
+        except Exception:
+            continue
+
+    # 2. Campo email/CPF
+    email_selectors = [
+        'input[data-testid="login-input-cpf-email"]',
+        'input[data-testid*="email"]',
+        'input[data-testid*="cpf"]',
+        'input[name="username"]',
+        'input[name="email"]',
+        'input[name="cpf"]',
+        'input[type="email"]',
+        'input[placeholder*="mail" i]',
+        'input[placeholder*="cpf" i]',
+        'input[autocomplete="username"]',
+    ]
+    email_field = None
+    for sel in email_selectors:
+        try:
+            f = page.locator(sel).first
+            if await f.is_visible(timeout=1500):
+                email_field = f
+                print(f"    campo email: {sel}")
+                break
+        except Exception:
+            continue
+    if not email_field:
+        print("    ❌ campo de email não encontrado")
+        return False
+    await email_field.click()
+    await email_field.fill("")
+    await email_field.type(EMAIL_VUPI, delay=random.randint(30, 80))
+
+    # 3. Campo senha
+    senha_selectors = [
+        'input[data-testid="login-input-password"]',
+        'input[type="password"]',
+        'input[data-testid*="password"]',
+        'input[name="password"]',
+        'input[autocomplete="current-password"]',
+    ]
+    senha_field = None
+    for sel in senha_selectors:
+        try:
+            f = page.locator(sel).first
+            if await f.is_visible(timeout=1500):
+                senha_field = f
+                print(f"    campo senha: {sel}")
+                break
+        except Exception:
+            continue
+    if not senha_field:
+        print("    ❌ campo de senha não encontrado")
+        return False
+    await senha_field.click()
+    await senha_field.fill("")
+    await senha_field.type(SENHA_VUPI, delay=random.randint(30, 70))
+    await asyncio.sleep(0.3)
+
+    # 4. Submete
+    submit_selectors = [
+        'button[data-testid="login-button-submit"]',
+        'button[data-testid*="submit"]',
+        'button[type="submit"]',
+        'form button:has-text("Entrar")',
+    ]
+    submitted = False
+    for sel in submit_selectors:
+        try:
+            btn = page.locator(sel).last
+            if await btn.is_visible(timeout=1000):
+                await btn.click()
+                print(f"    submit: {sel}")
+                submitted = True
+                break
+        except Exception:
+            continue
+    if not submitted:
+        await senha_field.press("Enter")
+        print("    submit: Enter")
+
+    # 5. Aguarda sessionid aparecer no localStorage
+    print("    aguardando login completar...")
+    for _ in range(40):  # ~20s
+        if await vp_esta_logado(page):
+            print(f"    ✅ logado")
+            await asyncio.sleep(1)
+            return True
+        await asyncio.sleep(0.5)
+    print("    ⚠️ timeout — login não confirmou em 20s")
+    return False
+
+
+# ╔══════════════════════════════════════════════════════════════╗
 # ║  VUPI SPORTSBOOK                                              ║
 # ╚══════════════════════════════════════════════════════════════╝
 
@@ -538,10 +673,10 @@ async def main():
     print()
 
     pw = await async_playwright().start()
-    print(f"-> conectando Brave CDP :{CDP_PORT}...")
+    print(f"-> conectando Chrome CDP :{CDP_PORT}...")
     browser = await pw.chromium.connect_over_cdp(f"http://localhost:{CDP_PORT}")
     if not browser.contexts:
-        print("X Brave sem contexts")
+        print("X Chrome sem contexts")
         return
     ctx = browser.contexts[0]
     page = None
@@ -552,9 +687,27 @@ async def main():
     if not page:
         page = ctx.pages[0]
         await page.goto("https://www.vupi.bet.br/", wait_until="domcontentloaded")
+        await asyncio.sleep(2)
     print(f"  aba: {page.url}")
 
-    print("-> auth Vupi...")
+    # Garante domínio
+    if "vupi.bet.br" not in (page.url or ""):
+        print("-> navegando pra Vupi...")
+        await page.goto("https://www.vupi.bet.br/",
+                        wait_until="domcontentloaded")
+        await asyncio.sleep(2)
+
+    # Verifica sessão; se não logado, faz login automático
+    if await vp_esta_logado(page):
+        print("-> sessão já ativa")
+    else:
+        print("-> sem sessão, executando login automático...")
+        if not await vp_fazer_login(page):
+            print("❌ Login automático falhou. Loga manual na janela do "
+                  "Chrome e roda de novo (ou ajusta os seletores).")
+            return
+
+    print("-> auth Vupi (capturando sessionid + identity)...")
     sessionid, identity = await vp_capturar_auth(page)
     print(f"  sessionid={sessionid[:20]}...  identity={identity[:20]}...")
 
